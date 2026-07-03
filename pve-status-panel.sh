@@ -851,37 +851,47 @@ if [ $(ls /dev/sd? 2> /dev/null | wc -l) -gt 0 ]; then
 done
 fi
 
-    # ---- IPMI 模式覆盖：CPU 频率仍用 lscpu，温度/风扇改用 ipmitool（服务器板正道）----
+    # ---- IPMI 模式覆盖：温度/风扇拆成「温度」「风扇」两行、值带单位（标签居左、值居右为 pmxInfoWidget 默认）。
+    #      后端已改“读文件”，此处只覆盖前端 cpu_temp_display。sensors 模式沿用上游渲染器（暂不动，
+    #      待本机（消费级主板）真机验证 sensors 读取后再统一渲染器）。----
     if [ "${MODE:-sensors}" = "ipmi" ]; then
-        read -r -d '' cpu_info_api <<'PSP_IPMI_API' || true
-	$res->{cpu_frequency} = `lscpu | grep MHz` . `cat /proc/cpuinfo | grep -i "cpu MHz"`;
-	$res->{cpu_temperatures} = `ipmitool sdr type Temperature 2>/dev/null` . `ipmitool sdr type Fan 2>/dev/null`;
-PSP_IPMI_API
+        # 温度项读 cpu_temperatures（ipmitool Temperature）、风扇项读 cpu_fans（ipmitool Fan）
         read -r -d '' cpu_temp_display <<'PSP_IPMI_DISP' || true
 ,
 	{
 	    itemId: 'cpu-temperatures',
 	    colspan: 2,
 	    printBar: false,
-	    title: gettext('温度 / 风扇'),
+	    title: gettext('温度'),
 	    textField: 'cpu_temperatures',
 	    renderer: function(value) {
 	        if (!value) { return '-'; }
-	        let temps = [], fans = [];
+	        let a = [];
 	        for (const line of value.split('\n')) {
 	            let f = line.split('|');
 	            if (f.length < 5) { continue; }
-	            let name = f[0].trim();
-	            let reading = f[4].trim();
-	            let mt = reading.match(/^(\d+)\s*degrees/);
-	            let mf = reading.match(/^(\d+)\s*RPM/);
-	            if (mt) { temps.push(name.replace(/ Temp$/, '') + ': ' + mt[1] + '°C'); }
-	            else if (mf) { fans.push(name + ': ' + mf[1]); }
+	            let m = f[4].trim().match(/^(\d+)\s*degrees/);
+	            if (m) { a.push(f[0].trim().replace(/ Temp$/, '') + ': ' + m[1] + '°C'); }
 	        }
-	        let out = '';
-	        if (temps.length) { out += '温度 ' + temps.join(' | '); }
-	        if (fans.length) { out += (out ? '<br>' : '') + '风扇(RPM) ' + fans.join(' | '); }
-	        return out || '-';
+	        return a.length ? a.join(' | ') : '-';
+	    }
+	},
+	{
+	    itemId: 'cpu-fans',
+	    colspan: 2,
+	    printBar: false,
+	    title: gettext('风扇'),
+	    textField: 'cpu_fans',
+	    renderer: function(value) {
+	        if (!value) { return '-'; }
+	        let a = [];
+	        for (const line of value.split('\n')) {
+	            let f = line.split('|');
+	            if (f.length < 5) { continue; }
+	            let m = f[4].trim().match(/^(\d+)\s*RPM/);
+	            if (m) { a.push(f[0].trim() + ': ' + m[1] + 'RPM'); }
+	        }
+	        return a.length ? a.join(' | ') : '-';
 	    }
 	},
 PSP_IPMI_DISP
@@ -918,8 +928,8 @@ if [ $height2 -le 325 ]; then
     height2="300"
 fi
 
-    # IPMI 卡片需温度 + 风扇两行余量
-    [ "${MODE:-}" = "ipmi" ] && height2=$(( ${height2:-300} + 68 ))
+    # IPMI 卡片：温度、风扇两独立行的余量
+    [ "${MODE:-}" = "ipmi" ] && height2=$(( ${height2:-300} + 102 ))
 }
 
 # 写出 perl 注入器（幂等 + 锚点定位；载荷从文件读入，避免插值）
@@ -969,7 +979,8 @@ _w() { local t=\"\$D/.wtmp.\$1.\$\$\"; cat > \"\$t\" 2>/dev/null && mv -f \"\$t\
 { lscpu | grep MHz; cat /proc/cpuinfo | grep -i 'cpu MHz'; } 2>/dev/null | _w cpu_frequency
 "
     if [ "${MODE:-sensors}" = "ipmi" ]; then
-        COLLECTOR+="{ ipmitool sdr type Temperature; ipmitool sdr type Fan; } 2>/dev/null | _w cpu_temperatures
+        COLLECTOR+="ipmitool sdr type Temperature 2>/dev/null | _w cpu_temperatures
+ipmitool sdr type Fan 2>/dev/null | _w cpu_fans
 "
     else
         COLLECTOR+="sensors 2>/dev/null | _w cpu_temperatures
