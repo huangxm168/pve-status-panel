@@ -13,12 +13,17 @@ STATE_DIR=/usr/local/share/pve-status-panel
 # 先摘 hook，避免还原后又被自愈重打
 rm -f "$HOOK"
 
-# 还原官方原版（applier 内部经 .orig 精确回退，含卡片高度）
+# 还原官方原版（applier 内部经 .orig 精确回退，含卡片高度；并停采集器、清 /run 数据）
 if [ -x "$BIN" ]; then
     "$BIN" restore
 else
     echo "未找到 $BIN，跳过还原（可能已卸载）"
 fi
+
+# 移除采集器 systemd 单元
+systemctl disable --now pve-status-panel-collect.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/pve-status-panel-collect.timer /etc/systemd/system/pve-status-panel-collect.service
+systemctl daemon-reload >/dev/null 2>&1 || true
 
 if [ "${1:-}" = "--full" ]; then
     rm -f "$BIN"

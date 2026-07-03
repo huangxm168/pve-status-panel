@@ -24,6 +24,34 @@ fi
 # 部署 applier
 install -m 0755 "$SRC_DIR/pve-status-panel.sh" "$BIN"
 
+# 部署采集器 systemd 单元：oneshot service + 15s timer。采集在普通 root 上下文跑（能访问
+# /dev/ipmi0、/dev/nvme*、无 perl -T 污点），把数据写 /run/pve-status-panel，后端注入只读之。
+cat > /etc/systemd/system/pve-status-panel-collect.service <<'EOF'
+[Unit]
+Description=pve-status-panel hardware sensor collector
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pve-status-panel-collect
+EOF
+
+cat > /etc/systemd/system/pve-status-panel-collect.timer <<'EOF'
+[Unit]
+Description=Refresh pve-status-panel sensor data every 15s
+
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=15
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now pve-status-panel-collect.timer >/dev/null 2>&1 || true
+
 # 部署 APT 自愈 hook：pve-manager 升级会覆盖注入文件，每次 apt 后自动重打
 cat > "$HOOK" <<EOF
 // pve-status-panel —— pve-manager 升级会还原被注入的 Nodes.pm / pvemanagerlib.js，

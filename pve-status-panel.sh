@@ -15,6 +15,9 @@ export LC_ALL="${LC_ALL:-en_US.UTF-8}"
 NODES_PM="/usr/share/perl5/PVE/API2/Nodes.pm"
 PVEMGR_JS="/usr/share/pve-manager/js/pvemanagerlib.js"
 STATE_DIR="/usr/local/share/pve-status-panel"
+RUN_DIR="/run/pve-status-panel"
+COLLECTOR_BIN="/usr/local/bin/pve-status-panel-collect"
+TIMER="pve-status-panel-collect.timer"
 MARK_BEGIN="pve-status-panel:BEGIN"
 MARK_END="pve-status-panel:END"
 
@@ -952,20 +955,78 @@ _bump_height() {
     sed -i "/widget.pveNodeStatus/,/},/ s/height: [0-9]\+/height: ${1}/" "$PVEMGR_JS"
 }
 
+# 生成采集脚本内容（全局 COLLECTOR）：普通 root 上下文跑硬件命令、把各字段写入 $RUN_DIR/<field>。
+# 与前端 textField 同名（cpu_frequency / cpu_temperatures / <dev>_status），供后端只读回填。
+# 采集在 pvedaemon 之外运行 => 无 perl -T 污点、且能访问 /dev/ipmi0 与 /dev/nvme*（守护进程内两者均受限）。
+_build_collector() {
+    local dev code
+    COLLECTOR="#!/usr/bin/env bash
+export LC_ALL=C
+D='${RUN_DIR}'
+mkdir -p \"\$D\"
+# 临时文件用隐藏名 + PID：后端 reader 跳过点开头文件、且并发采集不撞名；mv 原子替换
+_w() { local t=\"\$D/.wtmp.\$1.\$\$\"; cat > \"\$t\" 2>/dev/null && mv -f \"\$t\" \"\$D/\$1\"; }
+{ lscpu | grep MHz; cat /proc/cpuinfo | grep -i 'cpu MHz'; } 2>/dev/null | _w cpu_frequency
+"
+    if [ "${MODE:-sensors}" = "ipmi" ]; then
+        COLLECTOR+="{ ipmitool sdr type Temperature; ipmitool sdr type Fan; } 2>/dev/null | _w cpu_temperatures
+"
+    else
+        COLLECTOR+="sensors 2>/dev/null | _w cpu_temperatures
+"
+    fi
+    # iostat 采一次，供各盘复用（避免每盘各跑一次 1s 采样）
+    COLLECTOR+="_iostat=\"\$(iostat -d -x -k 1 1 2>/dev/null)\"
+"
+    for dev in $(ls -1 /dev/nvme? 2>/dev/null); do
+        code="${dev##*/}"
+        COLLECTOR+="{ smartctl -a ${dev} 2>/dev/null | grep -E 'Model Number|Total NVM Capacity|Temperature:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors'; echo \"\$_iostat\" | grep -E '^${code}'; } | _w ${code}_status
+"
+    done
+    for dev in $(ls -1 /dev/sd? 2>/dev/null); do
+        code="${dev##*/}"
+        COLLECTOR+="{ smartctl -a ${dev} 2>/dev/null | grep -E 'Model|Capacity|Power_On_Hours|Power_Cycle_Count|Power-Off_Retract_Count|Unexpected_Power_Loss|Unexpect_Power_Loss_Ct|POR_Recovery|Temperature'; echo \"\$_iostat\" | grep -E '^${code}'; } | _w ${code}_status
+"
+    done
+}
+
 apply() {
     command -v pvesh >/dev/null 2>&1 || { log "非 PVE 环境，退出"; return 1; }
     if grep -q "$MARK_BEGIN" "$NODES_PM" && grep -q "$MARK_BEGIN" "$PVEMGR_JS"; then
         log "已是注入状态，跳过（幂等）"; return 0
     fi
-    _build_payloads
+    _build_payloads      # 前端 INFO_DISPLAY + 卡片高度 height2
+    _build_collector     # 采集脚本 COLLECTOR
 
     local ins api_tmp js_tmp disp
     ins="$(mktemp)"; _write_perl_inserter "$ins"
 
-    # ---- 后端 Nodes.pm：注入 + perl -c 校验 + 失败回滚 ----
+    # ---- 部署采集器并立即采一次 ----
+    # pvedaemon 的 Web API 跑在 perl -T 污点模式、且其上下文看不到 /dev/ipmi0、/dev/nvme*，故不能在 status
+    # 处理函数里直接跑 ipmitool/smartctl（反引号 → "Insecure dependency" 500；run_command → 设备打不开）。
+    # 解耦：采集器在普通 root 上下文跑命令写 $RUN_DIR，后端只“读文件”回填——无污点、不碰设备、且更快。
+    # （CLI pvesh 不走 -T 也不受设备限制，故此前用 pvesh 验证未能暴露，须用真实 HTTP API 验证。）
+    printf '%s\n' "$COLLECTOR" > "$COLLECTOR_BIN"; chmod 0755 "$COLLECTOR_BIN"
+    "$COLLECTOR_BIN" >/dev/null 2>&1 || true
+
+    # ---- 后端 Nodes.pm：注入“只读 $RUN_DIR 回填 $res”静态块（file_get_contents，-T 安全）+ perl -c 兜底 ----
     _ensure_orig "$NODES_PM"
     api_tmp="$(mktemp)"
-    { printf '        # %s\n' "$MARK_BEGIN"; printf '%s\n' "$INFO_API"; printf '        # %s\n' "$MARK_END"; } > "$api_tmp"
+    {
+        printf '        # %s\n' "$MARK_BEGIN"
+        cat <<'PSP_READER'
+        {
+            my $psp_dir = '/run/pve-status-panel';
+            if (opendir(my $psp_dh, $psp_dir)) {
+                for my $psp_f (grep { !/^\./ && -f "$psp_dir/$_" } readdir($psp_dh)) {
+                    $res->{$psp_f} = eval { PVE::Tools::file_get_contents("$psp_dir/$psp_f") } // '';
+                }
+                closedir($psp_dh);
+            }
+        }
+PSP_READER
+        printf '        # %s\n' "$MARK_END"
+    } > "$api_tmp"
     cp -a "$NODES_PM" "$NODES_PM.psp-bak"
     perl "$ins" "$NODES_PM" "$api_tmp" nodes || { log "后端注入失败，回滚"; cp -a "$NODES_PM.psp-bak" "$NODES_PM"; rm -f "$NODES_PM.psp-bak" "$ins" "$api_tmp"; return 1; }
     if ! perl -c "$NODES_PM" >/dev/null 2>&1; then
@@ -987,6 +1048,7 @@ apply() {
     _bump_height "$height2"
 
     rm -f "$ins" "$api_tmp" "$js_tmp"
+    systemctl start "$TIMER" 2>/dev/null || true    # 若已装 timer 则确保在跑（周期刷新采集）
     systemctl restart pvedaemon pveproxy
     log "应用完成。浏览器 Ctrl+Shift+R 强刷即可看到概览卡片。"
 }
@@ -1004,8 +1066,11 @@ _restore_file() {
 restore() {
     _restore_file "$NODES_PM"
     _restore_file "$PVEMGR_JS"
+    systemctl stop "$TIMER" 2>/dev/null
+    rm -f "$COLLECTOR_BIN"
+    rm -rf "$RUN_DIR"
     systemctl restart pvedaemon pveproxy 2>/dev/null
-    log "已还原官方原版。浏览器 Ctrl+Shift+R 强刷。"
+    log "已还原官方原版（采集器已停）。浏览器 Ctrl+Shift+R 强刷。"
 }
 
 status() {
@@ -1014,6 +1079,8 @@ status() {
     echo "pvemanagerlib 注入: $(grep -q "$MARK_BEGIN" "$PVEMGR_JS" && echo yes || echo no)"
     echo "原文件快照(.orig) : $(ls "$STATE_DIR"/*.orig 2>/dev/null | wc -l) 个"
     echo "APT 自愈 hook     : $([ -f /etc/apt/apt.conf.d/99-pve-status-panel ] && echo installed || echo absent)"
+    echo "采集器 timer      : $(systemctl is-active "$TIMER" 2>/dev/null || echo inactive)"
+    echo "采集数据          : $(ls "$RUN_DIR" 2>/dev/null | wc -l) 个字段 @ $RUN_DIR"
 }
 
 case "${1:-}" in
