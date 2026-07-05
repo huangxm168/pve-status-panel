@@ -920,7 +920,9 @@ PSP_IPMI_DISP
 	            let t = line.match(/:\s*\+?([\d.]+)\s*C(?:\s|$)/);
 	            if (t && !seen[chip]) {
 	                seen[chip] = 1;
-	                out.push((map[chip] || chip) + ': ' + Math.round(parseFloat(t[1])) + '°C');
+	                // Super I/O 芯片（Nuvoton nct6xxx / ITE it8xxx / winbond / fintek）首个温度即 SYSTIN，标为 MB（主板）
+	                let label = map[chip] || (/^(nct6\d{3}|it8\d{3}|w836|f71)/.test(chip) ? 'MB' : chip);
+	                out.push(label + ': ' + Math.round(parseFloat(t[1])) + '°C');
 	            }
 	        }
 	        out.sort((a, b) => ((prio[a.split(':')[0]] ?? 2) - (prio[b.split(':')[0]] ?? 2)));
