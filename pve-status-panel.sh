@@ -17,8 +17,10 @@ PVEMGR_JS="/usr/share/pve-manager/js/pvemanagerlib.js"
 STATE_DIR="/usr/local/share/pve-status-panel"
 RUN_DIR="/run/pve-status-panel"
 COLLECTOR_BIN="/usr/local/bin/pve-status-panel-collect"
+SERVICE="pve-status-panel-collect.service"
 TIMER="pve-status-panel-collect.timer"
 SENSORS_CONF="/etc/modules-load.d/pve-status-panel-sensors.conf"
+DEFAULT_INTERVAL=5    # 采集刷新间隔（秒），可被 install.sh <秒> / set-interval <秒> 覆盖
 MARK_BEGIN="pve-status-panel:BEGIN"
 MARK_END="pve-status-panel:END"
 
@@ -46,20 +48,12 @@ detect_cpu_platform() {
     esac
 }
 
-# 生成注入载荷：产出 INFO_API（后端 Perl）/ INFO_DISPLAY（前端 JS）/ height2（卡片高度）
-# 下面 cpu_freq / cpu_temp(sensors) / nvme / hdd 渲染逻辑复用上游「精华」，原样保留
+# 生成注入载荷：产出 INFO_DISPLAY（前端 JS 渲染项）与 height2（卡片高度）。
+# cpu_freq / nvme / hdd 渲染器复用上游；温度·风扇渲染器由本项目按 ipmi/sensors 覆盖（见下方 override）。
 _build_payloads() {
     MODE="$(detect_mode)"
     detect_cpu_platform
     log "数据源模式: $MODE，CPU 平台: $CPU"
-    cpu_info_api='		
-	my $cpufreqs = `lscpu | grep MHz`;
-	my $corefreqs = `cat /proc/cpuinfo | grep -i  "cpu MHz"`;
-	$res->{cpu_frequency} = $cpufreqs . $corefreqs;
-
-    # 获取所有温度传感器数据,包括网卡温度
-    $res->{cpu_temperatures} = `sensors 2>/dev/null`;
-		'
 
     # CPU 主频信息 Web UI
     cpu_freq_display=',
@@ -97,305 +91,13 @@ _build_payloads() {
 	    }
 	}'
 
-    # CPU 温度信息 Web UI (保持原有的Intel和AMD特定代码)
-    if [ $CPU = "Intel" ]; then
-        cpu_temp_display='
-	{
-	    itemId: '"'"'cpu-temperatures'"'"',
-	    colspan: 2,
-	    printBar: false,
-	    title: gettext('"'"'CPU温度'"'"'),
-	    textField: '"'"'cpu_temperatures'"'"',
-	    renderer: function(value) {
-	        value = value.replace(/Â/g, '"'"''"'"');
-	        let data = [];
-	        let cpus = value.matchAll(/^coretemp-isa-(\d{4})$\\n.*?\\n((?:Package|Core)[\s\S]*?^\\n)+/gm);
-	        for (const cpu of cpus) {
-	            let cpuNumber = parseInt(cpu[1], 10);
-	            data[cpuNumber] = {
-	                   packages: [],
-	                   cores: []
-	            };
-
-	            let packages = cpu[2].matchAll(/^Package id \d+:\s*\+([^°]+).*$/gm);
-	            for (const package of packages) {
-	                data[cpuNumber]['"'"'packages'"'"'].push(package[1]);
-	            }
-
-	            let cores = cpu[2].matchAll(/^Core \d+:\s*\+([^°]+).*$/gm);
-	            for (const core of cores) {
-	                data[cpuNumber]['"'"'cores'"'"'].push(core[1]);
-	            }
-	        }
-
-	        let output = '"'"''"'"';
-	        for (const [i, cpu] of data.entries()) {
-	            if (cpu.packages.length > 0) {
-	                for (const packageTemp of cpu.packages) {
-	                    output += `CPU ${i+1}: ${packageTemp}°C `;
-	                }
-	            }
-
-	            if (cpu.cores.length > 0 && cpu.cores.length <= 4) {
-	                output += '"'"'('"'"';
-	                for (j = 1;j < cpu.cores.length;) {
-	                    for (const coreTemp of cpu.cores) {
-	                        output += `核心 ${j++}: ${coreTemp}°C, `;
-	                    }
-	                }
-	                output = output.slice(0, -2);
-	                output += '"'"')'"'"';
-	            }
-
-	            let acpitzs = value.matchAll(/^acpitz-acpi-(\d*)$\\n.*?\\n((?:temp)[\s\S]*?^\\n)+/gm);
-	            for (const acpitz of acpitzs) {
-	                let acpitzNumber = parseInt(acpitz[1], 10);
-	                data[acpitzNumber] = {
-	                       acpisensors: []
-	                };
-
-	                let acpisensors = acpitz[2].matchAll(/^temp\d+:\s*\+([^°]+).*$/gm);
-	                for (const acpisensor of acpisensors) {
-	                    data[acpitzNumber]['"'"'acpisensors'"'"'].push(acpisensor[1]);
-	                }
-
-	                for (const [k, acpitz] of data.entries()) {
-	                    if (acpitz.acpisensors.length > 0) {
-	                        output += '"'"' | 主板: '"'"';
-	                        for (const acpiTemp of acpitz.acpisensors) {
-	                            output += `${acpiTemp}°C, `;
-	                        }
-	                        output = output.slice(0, -2);
-	                    }
-	                }
-	            }
-
-	            let FunStates = value.matchAll(/^[a-zA-z]{2,3}\d{4}-isa-(\w{4})$\\n((?![ \S]+: *\d+ +RPM)[ \S]*?\\n)*((?:[ \S]+: *\d+ RPM)[\s\S]*?^\\n)+/gm);
-	            for (const FunState of FunStates) {
-	                let FanNumber = 0;
-	                data[FanNumber] = {
-	                    rotationals: [],
-	                    cpufans: [],
-	                    pumpfans: [],
-	                    systemfans: []
-	                };
-
-	                let rotationals = FunState[3].match(/^([ \S]+: *[0-9]\d* +RPM)[ \S]*?$/gm);
-	                for (const rotational of rotationals) {
-	                    if (rotational.toLowerCase().indexOf("pump") !== -1 || rotational.toLowerCase().indexOf("opt") !== -1){
-	                        let pumpfans = rotational.matchAll(/^[ \S]+: *([1-9]\d*) +RPM[ \S]*?$/gm);
-	                        for (const pumpfan of pumpfans) {
-	                            data[FanNumber]['"'"'pumpfans'"'"'].push(pumpfan[1]);
-	                        }
-	                    } else if (rotational.toLowerCase().indexOf("cpu") !== -1){
-	                        let cpufans = rotational.matchAll(/^[ \S]+: *([1-9]\d*) +RPM[ \S]*?$/gm);
-	                        for (const cpufan of cpufans) {
-	                            data[FanNumber]['"'"'cpufans'"'"'].push(cpufan[1]);
-	                        }
-	                    } else {
-	                        let systemfans = rotational.matchAll(/^[ \S]+: *([1-9]\d*) +RPM[ \S]*?$/gm);
-	                        for (const systemfan of systemfans) {
-	                            data[FanNumber]['"'"'systemfans'"'"'].push(systemfan[1]);
-	                        }
-	                    }
-	                }
-
-	                for (const [j, FunState] of data.entries()) {
-	                    if (FunState.cpufans.length > 0 || FunState.pumpfans.length > 0 || FunState.systemfans.length > 0) {
-	                        output += '"'"' | 风扇: '"'"';
-	                        if (FunState.cpufans.length > 0) {
-	                            output += '"'"'CPU-'"'"';
-	                            for (const cpufan_value of FunState.cpufans) {
-	                                output += `${cpufan_value}转/分钟, `;
-	                            }
-	                        }
-
-	                        if (FunState.pumpfans.length > 0) {
-	                            output += '"'"'水冷-'"'"';
-	                            for (const pumpfan_value of FunState.pumpfans) {
-	                                output += `${pumpfan_value}转/分钟, `;
-	                            }
-	                        }
-
-	                        if (FunState.systemfans.length > 0) {
-	                            if (FunState.cpufans.length > 0 || FunState.pumpfans.length > 0) {
-	                                output += '"'"'系统-'"'"';
-	                            }
-	                            for (const systemfan_value of FunState.systemfans) {
-	                                output += `${systemfan_value}转/分钟, `;
-	                            }
-	                        }
-	                        output = output.slice(0, -2);
-	                    } else if (FunState.cpufans.length == 0 && FunState.pumpfans.length == 0 && FunState.systemfans.length == 0) {
-	                        output += '"'"' | 风扇: 停转'"'"';
-	                    }
-	                }
-	            }
-
-	            if (cpu.cores.length > 4) {
-	                output += '"'"'\\n'"'"';
-	                for (j = 1;j < cpu.cores.length;) {
-	                    for (const coreTemp of cpu.cores) {
-	                        output += `核心 ${j++}: ${coreTemp}°C`;
-	                        output += '"'"' | '"'"';
-	                        if ((j-1) % 4 == 0){
-	                            output = output.slice(0, -2);
-	                            output += '"'"'\\n'"'"';
-	                        }
-	                    }
-	                }
-	                output = output.slice(0, -2);
-	            }
-	        }
-
-	        return output.replace(/\\n/g, '"'"'<br>'"'"');
-	    }
-	}'
-    elif [ $CPU = "AMD" ]; then
-        cpu_temp_display=',
-	{
-	    itemId: '"'"'cpu-temperatures'"'"',
-	    colspan: 2,
-	    printBar: false,
-	    title: gettext('"'"'CPU温度'"'"'),
-	    textField: '"'"'cpu_temperatures'"'"',
-	    renderer: function(value) {
-	        value = value.replace(/Â/g, '"'"''"'"');
-	        let data = [];
-	        let cpus = value.matchAll(/^k10temp-pci-(\w{4})$\\n.*?\\n((?:Tctl)[\s\S]*?^\\n)+/gm);
-	        for (const cpu of cpus) {
-	            let cpuNumber = 0;
-	            data[cpuNumber] = {
-	                   packages: []
-	            };
-
-	            let packages = cpu[2].matchAll(/^Tctl:\s*\+([^°]+).*$/gm);
-	            for (const package of packages) {
-	                data[cpuNumber]['"'"'packages'"'"'].push(package[1]);
-	            }
-	        }
-
-	        let output = '"'"''"'"';
-	        for (const [i, cpu] of data.entries()) {
-	            if (cpu.packages.length > 0) {
-	                for (const packageTemp of cpu.packages) {
-	                    output += `CPU ${i+1}: ${packageTemp}°C `;
-	                }
-	            }
-
-	            let gpus = value.matchAll(/^amdgpu-pci-(\d*)$\\n((?!edge:)[ \S]*?\\n)*((?:edge)[\s\S]*?^\\n)+/gm);
-	            for (const gpu of gpus) {
-	                let gpuNumber = 0;
-	                data[gpuNumber] = {
-	                       edges: []
-	                };
-
-	                let edges = gpu[3].matchAll(/^edge:\s*\+([^°]+).*$/gm);
-	                for (const edge of edges) {
-	                    data[gpuNumber]['"'"'edges'"'"'].push(edge[1]);
-	                }
-
-	                for (const [k, gpu] of data.entries()) {
-	                    if (gpu.edges.length > 0) {
-	                        output += '"'"' | 核显: '"'"';
-	                        for (const edgeTemp of gpu.edges) {
-	                            output += `${edgeTemp}°C, `;
-	                        }
-	                        output = output.slice(0, -2);
-	                    }
-	                }
-	            }
-
-	            let FunStates = value.matchAll(/^[a-zA-z]{2,3}\d{4}-isa-(\w{4})$\\n((?![ \S]+: *\d+ +RPM)[ \S]*?\\n)*((?:[ \S]+: *\d+ RPM)[\s\S]*?^\\n)+/gm);
-	            for (const FunState of FunStates) {
-	                let FanNumber = 0;
-	                data[FanNumber] = {
-	                    rotationals: [],
-	                    cpufans: [],
-	                    pumpfans: [],
-	                    systemfans: []
-	                };
-
-	                let rotationals = FunState[3].match(/^([ \S]+: *[0-9]\d* +RPM)[ \S]*?$/gm);
-	                for (const rotational of rotationals) {
-	                    if (rotational.toLowerCase().indexOf("pump") !== -1 || rotational.toLowerCase().indexOf("opt") !== -1){
-	                        let pumpfans = rotational.matchAll(/^[ \S]+: *([1-9]\d*) +RPM[ \S]*?$/gm);
-	                        for (const pumpfan of pumpfans) {
-	                            data[FanNumber]['"'"'pumpfans'"'"'].push(pumpfan[1]);
-	                        }
-	                    } else if (rotational.toLowerCase().indexOf("cpu") !== -1){
-	                        let cpufans = rotational.matchAll(/^[ \S]+: *([1-9]\d*) +RPM[ \S]*?$/gm);
-	                        for (const cpufan of cpufans) {
-	                            data[FanNumber]['"'"'cpufans'"'"'].push(cpufan[1]);
-	                        }
-	                    } else {
-	                        let systemfans = rotational.matchAll(/^[ \S]+: *([1-9]\d*) +RPM[ \S]*?$/gm);
-	                        for (const systemfan of systemfans) {
-	                            data[FanNumber]['"'"'systemfans'"'"'].push(systemfan[1]);
-	                        }
-	                    }
-	                }
-
-	                for (const [j, FunState] of data.entries()) {
-	                    if (FunState.cpufans.length > 0 || FunState.pumpfans.length > 0 || FunState.systemfans.length > 0) {
-	                        output += '"'"' | 风扇: '"'"';
-	                        if (FunState.cpufans.length > 0) {
-	                            output += '"'"'CPU-'"'"';
-	                            for (const cpufan_value of FunState.cpufans) {
-	                                output += `${cpufan_value}转/分钟, `;
-	                            }
-	                        }
-
-	                        if (FunState.pumpfans.length > 0) {
-	                            output += '"'"'水冷-'"'"';
-	                            for (const pumpfan_value of FunState.pumpfans) {
-	                                output += `${pumpfan_value}转/分钟, `;
-	                            }
-	                        }
-
-	                        if (FunState.systemfans.length > 0) {
-	                            if (FunState.cpufans.length > 0 || FunState.pumpfans.length > 0) {
-	                                output += '"'"'系统-'"'"';
-	                            }
-	                            for (const systemfan_value of FunState.systemfans) {
-	                                output += `${systemfan_value}转/分钟, `;
-	                            }
-	                        }
-	                        output = output.slice(0, -2);
-	                    } else if (FunState.cpufans.length == 0 && FunState.pumpfans.length == 0 && FunState.systemfans.length == 0) {
-	                        output += '"'"' | 风扇: 停转'"'"';
-	                    }
-	                }
-	            }
-	        }
-
-	        return output.replace(/\\n/g, '"'"'<br>'"'"');
-	    }
-	}'
-    fi
 
     # NVME 硬盘信息 API 及 Web UI
-    nvme_height="0"
     if [ $(ls /dev/nvme? 2> /dev/null | wc -l) -gt 0 ]; then
         i="1"
-        nvme_info_api=''
         nvme_info_display=''
         for nvme_device in $(ls -1 /dev/nvme?); do
             nvme_code=${nvme_device##*/}
-	        if [[ $(smartctl -a $nvme_device|grep -E "Cycle") && $(iostat -d -x -k 1 1 | grep -E "^$nvme_code") ]] && [[ $(smartctl -a $nvme_device|grep -E "Model") || $(smartctl -a $nvme_device|grep -E "Capacity") ]]; then
-	            nvme_degree="2"
-	        else
-	            nvme_degree="1"
-	        fi
-            nvme_tmp_height="$[nvme_degree*17+7]"
-			nvme_height="$[nvme_height + nvme_tmp_height]"
-            nvme_info_api_tmp='
-	my $'$nvme_code'_temperatures = `smartctl -a '$nvme_device'|grep -E "Model Number|Total NVM Capacity|Temperature:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors"`;
-	my $'$nvme_code'_io = `iostat -d -x -k 1 1 | grep -E "^'$nvme_code'"`;
-	$res->{'$nvme_code'_status} = $'$nvme_code'_temperatures . $'$nvme_code'_io;
-		'
-        nvme_info_api="$nvme_info_api$nvme_info_api_tmp"
-
         nvme_info_display_tmp=',
 	{
 	    itemId: '"'"''$nvme_code'-status'"'"',
@@ -623,27 +325,11 @@ _build_payloads() {
 fi
 
 # 其他存储设备信息 API 及 Web UI
-hdd_height="0"
 if [ $(ls /dev/sd? 2> /dev/null | wc -l) -gt 0 ]; then
     i="1"
-    hdd_info_api=''
     hdd_info_display=''
     for hdd_device in $(ls -1 /dev/sd?); do
         hdd_code=${hdd_device##*/}
-	    if [[ $(smartctl -a $hdd_device|grep -E "Cycle") && $(iostat -d -x -k 1 1 | grep -E "^$hdd_code") ]] && [[ $(smartctl -a $hdd_device|grep -E "Model") || $(smartctl -a $hdd_device|grep -E "Capacity") ]]; then
-	        hdd_degree="2"
-	    else
-	        hdd_degree="1"
-	    fi
-	hdd_tmp_height="$[hdd_degree*17+7]"
-	hdd_height="$[hdd_height + hdd_tmp_height]"
-        hdd_info_api_tmp='
-	my $'$hdd_code'_temperatures = `smartctl -a '$hdd_device'|grep -E "Model|Capacity|Power_On_Hours|Power_Cycle_Count|Power-Off_Retract_Count|Unexpected_Power_Loss|Unexpect_Power_Loss_Ct|POR_Recovery|Temperature"`;
-	my $'$hdd_code'_io = `iostat -d -x -k 1 1 | grep -E "^'$hdd_code'"`;
-	$res->{'$hdd_code'_status} = $'$hdd_code'_temperatures . $'$hdd_code'_io;
-		'
-    hdd_info_api="$hdd_info_api$hdd_info_api_tmp"
-
     hdd_info_display_tmp=',
 	{
 	    itemId: '"'"''$hdd_code'-status'"'"',
@@ -947,40 +633,17 @@ PSP_IPMI_DISP
 	},
 PSP_SENSORS_DISP
     fi
-# API
-INFO_API="$cpu_info_api$nvme_info_api$hdd_info_api"
-# Web UI
-INFO_DISPLAY="$cpu_freq_display$cpu_temp_display$nvme_info_display$hdd_info_display"
+    # 组装前端注入（后端已改「读文件」，不再需要 INFO_API / 临时文件）
+    INFO_DISPLAY="$cpu_freq_display$cpu_temp_display$nvme_info_display$hdd_info_display"
 
-# 缓存代码
-# echo -e "\n" > /tmp/0.txt
-# echo -e "	    value: '',\n	}," > /tmp/1.txt
-echo -e "$INFO_API" > /tmp/2.txt
-echo -e "	    value: '',\n	}$INFO_DISPLAY" > /tmp/3.txt
-
-# CPU 主频及温度 UI 高度
-cpu_degree="$(sensors 2>/dev/null | grep $cpu_keyword | wc -l)"
-core_degree="$(sensors 2>/dev/null | grep Core | wc -l)"
-process_degree="$(cat /proc/cpuinfo | grep -i "cpu MHz" | wc -l)"
-if [ $core_degree -gt 4 ]; then
-    cpu_temp_degree="$[cpu_degree + (core_degree+4-1)/4]"
-else
-    cpu_temp_degree="$cpu_degree"
-fi
-cpu_temp_height="$[cpu_temp_degree*17+7]"
-cpu_freq_degree="$[cpu_degree + (process_degree+4-1)/4]"
-cpu_freq_height="$[cpu_freq_degree*17+7]"
-
-# Web UI 总高度
-#height1="$[400 + (cpu_temp_height + cpu_freq_height + nvme_height + hdd_height)]"
-#height1="400"
-height2="$[300 + cpu_temp_height + cpu_freq_height + nvme_height + hdd_height + 25]"
-if [ $height2 -le 325 ]; then
-    height2="300"
-fi
-
-    # 温度、风扇两独立行的余量（两模式一致）
-    height2=$(( ${height2:-300} + 102 ))
+    # 卡片高度（绝对像素，含原生行 + 注入行）：按显示行数估算，不依赖 sensors；宁大勿小（多余只留白，偏小会裁切）。
+    # CPU 主频网格约 4 线程/行 + 汇总；温度、风扇各 1 行；每块盘卡片约 2-3 行。
+    local threads freq_lines nvme_n hdd_n
+    threads="$(nproc 2>/dev/null || echo 4)"
+    freq_lines=$(( (threads + 3) / 4 + 1 ))
+    nvme_n=$(ls /dev/nvme? 2>/dev/null | wc -l)
+    hdd_n=$(ls /dev/sd? 2>/dev/null | wc -l)
+    height2=$(( 360 + (freq_lines + 2) * 20 + (nvme_n + hdd_n) * 55 + 30 ))
 }
 
 # 写出 perl 注入器（幂等 + 锚点定位；载荷从文件读入，避免插值）
@@ -1135,6 +798,45 @@ restore() {
     log "已还原官方原版（采集器已停）。浏览器 Ctrl+Shift+R 强刷。"
 }
 
+# 写采集器 systemd 单元（oneshot service + 周期 timer），$1=间隔秒数
+_write_timer_units() {
+    local iv="${1:-$DEFAULT_INTERVAL}"
+    cat > "/etc/systemd/system/$SERVICE" <<EOF
+[Unit]
+Description=pve-status-panel hardware sensor collector
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=$COLLECTOR_BIN
+EOF
+    cat > "/etc/systemd/system/$TIMER" <<EOF
+[Unit]
+Description=Refresh pve-status-panel sensor data every ${iv}s
+
+[Timer]
+OnBootSec=${iv}
+OnUnitActiveSec=${iv}
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "$TIMER" >/dev/null 2>&1 || true
+}
+
+# 设置采集刷新间隔（秒）；无参则用默认。改后立即生效、重启仍生效
+set_interval() {
+    [ "$(id -u)" = 0 ] || { log "需 root 运行"; return 1; }
+    local iv="${1:-$DEFAULT_INTERVAL}"
+    { [[ "$iv" =~ ^[0-9]+$ ]] && [ "$iv" -ge 2 ]; } || { log "用法: set-interval <秒>（整数，≥2）"; return 1; }
+    _write_timer_units "$iv"
+    systemctl restart "$TIMER" 2>/dev/null || true
+    "$COLLECTOR_BIN" >/dev/null 2>&1 || true
+    log "采集刷新间隔已设为 ${iv} 秒。"
+}
+
 # 可选：为消费级板加载 Super I/O 风扇/温度驱动（内核自带模块，不编译/不 dkms）。
 # 逐一试探常见驱动，哪个让 sensors 冒出 fanN 行即命中并持久化到 modules-load.d；采集器下个周期自动读到。
 setup_sensors() {
@@ -1175,7 +877,7 @@ status() {
     echo "pvemanagerlib 注入: $(grep -q "$MARK_BEGIN" "$PVEMGR_JS" && echo yes || echo no)"
     echo "原文件快照(.orig) : $(ls "$STATE_DIR"/*.orig 2>/dev/null | wc -l) 个"
     echo "APT 自愈 hook     : $([ -f /etc/apt/apt.conf.d/99-pve-status-panel ] && echo installed || echo absent)"
-    echo "采集器 timer      : $(systemctl is-active "$TIMER" 2>/dev/null || echo inactive)"
+    echo "采集器 timer      : $(systemctl is-active "$TIMER" 2>/dev/null || echo inactive)（间隔 $(grep -oP 'OnUnitActiveSec=\K[0-9]+' "/etc/systemd/system/$TIMER" 2>/dev/null || echo '?') 秒）"
     echo "采集数据          : $(ls "$RUN_DIR" 2>/dev/null | wc -l) 个字段 @ $RUN_DIR"
     echo "风扇数据          : $(grep -qsE '[1-9][0-9]* *RPM' "$RUN_DIR"/cpu_fans "$RUN_DIR"/cpu_temperatures && echo 有 || echo '无（消费级板可跑 setup-sensors 开启）')"
 }
@@ -1185,5 +887,6 @@ case "${1:-}" in
     restore)       restore ;;
     status)        status ;;
     setup-sensors) setup_sensors ;;
-    *) echo "用法: $0 {apply|restore|status|setup-sensors}"; exit 2 ;;
+    set-interval)  set_interval "${2:-}" ;;
+    *) echo "用法: $0 {apply|restore|status|setup-sensors|set-interval <秒>}"; exit 2 ;;
 esac

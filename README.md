@@ -29,10 +29,12 @@
 ```bash
 git clone https://github.com/<your-account>/pve-status-panel.git
 cd pve-status-panel
-sudo ./install.sh
+sudo ./install.sh          # 或 sudo ./install.sh 3   指定采集刷新间隔（秒，默认 5）
 ```
 
-安装做四件事：清除 `smartctl`/`iostat` 的 setuid 基线、部署 `pve-status-panel` 到 `/usr/local/bin`、安装 APT 自愈 hook、首次应用。完成后在浏览器 **Ctrl+Shift+R** 强刷即可看到。
+安装：清除 `smartctl`/`iostat` 的 setuid 基线、部署 `pve-status-panel` 到 `/usr/local/bin`、注入 + 部署采集器 timer、安装 APT 自愈 hook、首次应用。完成后在浏览器 **Ctrl+Shift+R** 强刷即可看到。
+
+**刷新频率**：采集器每 N 秒刷新一次数据（默认 5 秒）。安装时用后缀参数指定（`./install.sh 3`），或随时 `pve-status-panel set-interval <秒>` 修改（≥2 秒；改后立即生效、重启仍生效）。
 
 ## 卸载 / 还原
 
@@ -48,6 +50,7 @@ pve-status-panel status         # 查看模式 / 注入状态 / hook / 采集器
 pve-status-panel apply          # 手动重打（幂等；hook 亦会自动调用）
 pve-status-panel restore        # 还原官方原版
 pve-status-panel setup-sensors  # 消费级板：探测并加载 Super I/O 风扇驱动（不编译，持久化）
+pve-status-panel set-interval 3 # 修改采集刷新间隔（秒，≥2）
 PSP_MODE=sensors pve-status-panel apply   # 强制指定数据源（ipmi|sensors）
 ```
 

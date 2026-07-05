@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # 安装 pve-status-panel：在 PVE 节点「概览」卡片显示 CPU/温度·风扇/NVMe·磁盘 信息
-# 加固安装：清 setuid 基线 + 部署 applier + 装 APT 自愈 hook + 首次应用
+# 加固安装：清 setuid 基线 + 部署 applier + 首次应用 + 部署采集器 timer + APT 自愈 hook
+# 用法：sudo ./install.sh [采集间隔秒数]   省略则用默认 5 秒；之后可 pve-status-panel set-interval <秒> 改
 set -euo pipefail
 
+INTERVAL="${1:-}"                 # 可选后缀参数：采集刷新间隔（秒），空则用 applier 内置默认
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN=/usr/local/bin/pve-status-panel
 HOOK=/etc/apt/apt.conf.d/99-pve-status-panel
@@ -24,34 +26,6 @@ fi
 # 部署 applier
 install -m 0755 "$SRC_DIR/pve-status-panel.sh" "$BIN"
 
-# 部署采集器 systemd 单元：oneshot service + 15s timer。采集在普通 root 上下文跑（能访问
-# /dev/ipmi0、/dev/nvme*、无 perl -T 污点），把数据写 /run/pve-status-panel，后端注入只读之。
-cat > /etc/systemd/system/pve-status-panel-collect.service <<'EOF'
-[Unit]
-Description=pve-status-panel hardware sensor collector
-After=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/pve-status-panel-collect
-EOF
-
-cat > /etc/systemd/system/pve-status-panel-collect.timer <<'EOF'
-[Unit]
-Description=Refresh pve-status-panel sensor data every 15s
-
-[Timer]
-OnBootSec=15
-OnUnitActiveSec=15
-AccuracySec=2s
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now pve-status-panel-collect.timer >/dev/null 2>&1 || true
-
 # 部署 APT 自愈 hook：pve-manager 升级会覆盖注入文件，每次 apt 后自动重打
 cat > "$HOOK" <<EOF
 // pve-status-panel —— pve-manager 升级会还原被注入的 Nodes.pm / pvemanagerlib.js，
@@ -59,9 +33,11 @@ cat > "$HOOK" <<EOF
 DPkg::Post-Invoke { "[ -x $BIN ] && $BIN apply >/dev/null 2>&1 || true"; };
 EOF
 
-# 首次应用
+# 首次应用（注入 + 部署采集器脚本 + 立即采集一次）
 "$BIN" apply
+# 部署采集器 systemd 单元（含刷新间隔）：采集在普通 root 上下文跑，能访问 /dev/ipmi0、/dev/nvme*、无 perl -T 污点
+"$BIN" set-interval "$INTERVAL"
 
 echo
 echo "安装完成。请在浏览器按 Ctrl+Shift+R 强制刷新 PVE Web 界面查看节点「概览」卡片。"
-echo "查看状态：$BIN status ；卸载/还原：sudo ./restore.sh （--full 彻底删除）"
+echo "查看状态：$BIN status ；改采集间隔：$BIN set-interval <秒> ；卸载/还原：sudo ./restore.sh（--full 彻底删除）"
