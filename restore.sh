@@ -28,7 +28,9 @@ systemctl daemon-reload >/dev/null 2>&1 || true
 if [ "${1:-}" = "--full" ]; then
     rm -f "$BIN"
     rm -rf "$STATE_DIR"
-    echo "已彻底卸载（applier 与快照已删除）。"
+    # 撤销 setup-sensors 的持久化（已加载的模块保留至下次重启，无害）
+    rm -f /etc/modules-load.d/pve-status-panel-sensors.conf
+    echo "已彻底卸载（applier、快照、sensors 持久化已删除）。"
 else
     echo "已还原官方原版。applier 与快照保留（--full 可彻底删除）。浏览器 Ctrl+Shift+R 强刷。"
 fi

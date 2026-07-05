@@ -18,6 +18,7 @@ STATE_DIR="/usr/local/share/pve-status-panel"
 RUN_DIR="/run/pve-status-panel"
 COLLECTOR_BIN="/usr/local/bin/pve-status-panel-collect"
 TIMER="pve-status-panel-collect.timer"
+SENSORS_CONF="/etc/modules-load.d/pve-status-panel-sensors.conf"
 MARK_BEGIN="pve-status-panel:BEGIN"
 MARK_END="pve-status-panel:END"
 
@@ -889,9 +890,9 @@ fi
 	            let f = line.split('|');
 	            if (f.length < 5) { continue; }
 	            let m = f[4].trim().match(/^(\d+)\s*RPM/);
-	            if (m) { a.push(f[0].trim() + ': ' + m[1] + 'RPM'); }
+	            if (m && m[1] !== '0') { a.push(f[0].trim() + ': ' + m[1] + 'RPM'); }
 	        }
-	        return a.length ? a.join(' | ') : '-';
+	        return a.length ? a.join(' | ') : '—';
 	    }
 	},
 PSP_IPMI_DISP
@@ -937,7 +938,7 @@ PSP_IPMI_DISP
 	        let out = [];
 	        for (const line of value.split('\n')) {
 	            let m = line.match(/^([^\s:][^:]*?):\s*(\d+)\s*RPM/);
-	            if (m) { out.push(m[1].trim() + ': ' + m[2] + 'RPM'); }
+	            if (m && m[2] !== '0') { out.push(m[1].trim() + ': ' + m[2] + 'RPM'); }
 	        }
 	        return out.length ? out.join(' | ') : '—';
 	    }
@@ -1132,6 +1133,40 @@ restore() {
     log "已还原官方原版（采集器已停）。浏览器 Ctrl+Shift+R 强刷。"
 }
 
+# 可选：为消费级板加载 Super I/O 风扇/温度驱动（内核自带模块，不编译/不 dkms）。
+# 逐一试探常见驱动，哪个让 sensors 冒出 fanN 行即命中并持久化到 modules-load.d；采集器下个周期自动读到。
+setup_sensors() {
+    [ "$(id -u)" = 0 ] || { log "需 root 运行"; return 1; }
+    command -v sensors >/dev/null 2>&1 || { log "未装 lm-sensors，请先 apt install lm-sensors"; return 1; }
+    # 注意：用 here-string 而非「sensors | grep -q」——grep -q 命中即关管道，sensors 收 SIGPIPE 退非零，
+    # 叠加脚本顶部 set -o pipefail 会把命中误判成失败。here-string 无管道即无此坑。
+    local fan_re='^fan[0-9]+:.*RPM'
+    if grep -qE "$fan_re" <<< "$(sensors 2>/dev/null)"; then
+        log "当前 sensors 已能读到风扇，无需处理。"; grep -E "$fan_re" <<< "$(sensors 2>/dev/null)" | head; return 0
+    fi
+    log "当前读不到风扇，试探 Super I/O 驱动（内核自带，不编译）..."
+    local m found=""
+    for m in nct6775 nct6683 it87 w83627ehf f71882fg; do
+        modinfo "$m" >/dev/null 2>&1 || continue          # 内核无此驱动则跳过
+        modprobe "$m" 2>/dev/null || continue
+        if grep -qE "$fan_re" <<< "$(sensors 2>/dev/null)"; then found="$m"; break; fi
+        modprobe -r "$m" 2>/dev/null                       # 没帮上忙就卸掉，不留残留
+    done
+    if [ -n "$found" ]; then
+        printf '%s\n' "$found" > "$SENSORS_CONF"           # 持久化：开机自动加载
+        log "成功：驱动 $found 已加载并持久化（$SENSORS_CONF）。"
+        log "风扇将在采集器下个周期（≤15s）自动出现于概览；浏览器 Ctrl+Shift+R 可即时刷新。"
+        grep -E "$fan_re" <<< "$(sensors 2>/dev/null)" | head
+    elif grep -qiE 'ACPI.*resource.*conflict|resource.*conflict.*(nct|it87|superio)' <<< "$(dmesg 2>/dev/null)"; then
+        log "检测到 Super I/O 但其 I/O 端口被 ACPI 占用。需加内核参数后重启："
+        log "  /etc/default/grub 的 GRUB_CMDLINE_LINUX_DEFAULT 追加 acpi_enforce_resources=lax → update-grub → reboot → 再跑本命令"
+        return 1
+    else
+        log "未探测到受支持的 Super I/O 传感器芯片（可能内核过旧/芯片过新）。可更新内核或手动 sensors-detect 排查。"
+        return 1
+    fi
+}
+
 status() {
     echo "模式(自动探测)   : $(detect_mode)"
     echo "Nodes.pm 已注入   : $(grep -q "$MARK_BEGIN" "$NODES_PM" && echo yes || echo no)"
@@ -1140,11 +1175,13 @@ status() {
     echo "APT 自愈 hook     : $([ -f /etc/apt/apt.conf.d/99-pve-status-panel ] && echo installed || echo absent)"
     echo "采集器 timer      : $(systemctl is-active "$TIMER" 2>/dev/null || echo inactive)"
     echo "采集数据          : $(ls "$RUN_DIR" 2>/dev/null | wc -l) 个字段 @ $RUN_DIR"
+    echo "风扇数据          : $(grep -qsE '[1-9][0-9]* *RPM' "$RUN_DIR"/cpu_fans "$RUN_DIR"/cpu_temperatures && echo 有 || echo '无（消费级板可跑 setup-sensors 开启）')"
 }
 
 case "${1:-}" in
-    apply)   apply ;;
-    restore) restore ;;
-    status)  status ;;
-    *) echo "用法: $0 {apply|restore|status}"; exit 2 ;;
+    apply)         apply ;;
+    restore)       restore ;;
+    status)        status ;;
+    setup-sensors) setup_sensors ;;
+    *) echo "用法: $0 {apply|restore|status|setup-sensors}"; exit 2 ;;
 esac

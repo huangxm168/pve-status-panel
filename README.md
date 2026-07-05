@@ -44,23 +44,26 @@ sudo ./restore.sh --full   # 彻底卸载
 ## 常用命令
 
 ```bash
-pve-status-panel status     # 查看模式 / 注入状态 / hook 是否就位
-pve-status-panel apply      # 手动重打（幂等；hook 亦会自动调用）
-pve-status-panel restore    # 还原官方原版
+pve-status-panel status         # 查看模式 / 注入状态 / hook / 采集器 / 风扇是否就位
+pve-status-panel apply          # 手动重打（幂等；hook 亦会自动调用）
+pve-status-panel restore        # 还原官方原版
+pve-status-panel setup-sensors  # 消费级板：探测并加载 Super I/O 风扇驱动（不编译，持久化）
 PSP_MODE=sensors pve-status-panel apply   # 强制指定数据源（ipmi|sensors）
 ```
 
 ## 数据源模式
 
 - **ipmi**：存在 `/dev/ipmi0` 且 `ipmitool sdr` 可读时自动选用。温度 / 风扇来自 BMC，覆盖 CPU / 主板 / 网卡 / 内存 温度与全部风扇，稳定且不依赖内核版本。适合带 BMC 的服务器主板（如 ASRock Rack ROMED8-2T）。
-- **sensors**：无 IPMI 时回落，解析 `lm-sensors`（复用上游 Intel `coretemp` / AMD `k10temp` / it87 风扇 / amdgpu 渲染）。适合消费级主板；需宿主机自行用 `sensors-detect` 配好传感器。
+- **sensors**：无 IPMI 时回落，解析 `lm-sensors`。温度按芯片分组、友好标签（`k10temp`/`coretemp`→CPU、`amdgpu`→GPU，其余保留芯片名）、跳过 NVMe（已有独立卡片）；风扇过滤 0 RPM（未接的插座不显）。适合消费级主板。
+
+  消费级板的风扇/主板温挂在 Super I/O 芯片（Nuvoton `nct67xx` 用 `nct6775` 驱动、ITE 用 `it87`），全新系统默认不加载。跑一次 `pve-status-panel setup-sensors` 即可：它试探加载内核自带驱动（**不编译、不 dkms**）、命中即持久化到 `/etc/modules-load.d/`，采集器下个周期自动读到风扇——之后永久自动。搞不定的少数情况（ACPI 占用需 `acpi_enforce_resources=lax` / 芯片过新）只提示不硬来。
 
 ## 兼容性与说明
 
 - 面向 **PVE 8 / 9**（deb822 与传统源皆可；注入锚点基于官方 `Nodes.pm` / `pvemanagerlib.js` 结构）。
 - 后端注入带 `perl -c` 校验 + 回滚：即便未来某版本改了锚点导致注入不匹配，也只是面板不显示，**不会弄坏节点 API**。
 - 前端注入若锚点失配则该次不生效；不影响 SSH / API，`restore.sh` 可随时还原。
-- 本仓当前在 **IPMI 模式 + AMD EPYC（ROMED8-2T）** 上完整验证（apply / restore / 幂等 / 升级自愈 / `perl -c` / `node --check` 全过）。`sensors` 模式渲染逻辑源自上游、结构保留，建议在消费级主板上再行验证。
+- 已在两类真机完整验证：**IPMI 模式 + AMD EPYC（ROMED8-2T / PVE 9）** 与 **sensors 模式 + AMD Ryzen 9700X（ASUS X870E / PVE 8）**——apply / restore / 幂等 / 升级自愈 / `perl -c` / `node --check` / setup-sensors 均通过；PVE 8 与 9 注入锚点一致。
 - 每次「概览」刷新会运行 `ipmitool` / `smartctl` / `iostat` 采样，有轻微开销并会唤醒磁盘，属该类面板固有代价。
 
 ## 致谢
