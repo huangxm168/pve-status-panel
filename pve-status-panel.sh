@@ -895,6 +895,54 @@ fi
 	    }
 	},
 PSP_IPMI_DISP
+    else
+        # sensors（消费级板）：温度、风扇均读 cpu_temperatures（完整 sensors 输出）。
+        # 温度：按芯片分组、每芯片取首个温度值、友好标签（k10temp/coretemp→CPU、amdgpu→GPU）、跳过 nvme（已有独立卡片）。
+        # 值格式为「NAME: +51.2 C」（LC_ALL=C 无 ° 符号），故解析 " C" 结尾、输出时补 °C。风扇无数据显示 —。
+        read -r -d '' cpu_temp_display <<'PSP_SENSORS_DISP' || true
+,
+	{
+	    itemId: 'cpu-temperatures',
+	    colspan: 2,
+	    printBar: false,
+	    title: gettext('温度'),
+	    textField: 'cpu_temperatures',
+	    renderer: function(value) {
+	        if (!value) { return '-'; }
+	        const map = { k10temp: 'CPU', coretemp: 'CPU', amdgpu: 'GPU' };
+	        const prio = { CPU: 0, GPU: 1 };
+	        let chip = '', out = [], seen = {};
+	        for (const line of value.split('\n')) {
+	            let h = line.match(/^(\S+)-(?:pci|isa|acpi|virtual|i2c|spi)-\S+$/);
+	            if (h) { chip = h[1]; continue; }
+	            if (!chip || chip === 'nvme') { continue; }
+	            let t = line.match(/:\s*\+?([\d.]+)\s*C(?:\s|$)/);
+	            if (t && !seen[chip]) {
+	                seen[chip] = 1;
+	                out.push((map[chip] || chip) + ': ' + Math.round(parseFloat(t[1])) + '°C');
+	            }
+	        }
+	        out.sort((a, b) => ((prio[a.split(':')[0]] ?? 2) - (prio[b.split(':')[0]] ?? 2)));
+	        return out.length ? out.join(' | ') : '-';
+	    }
+	},
+	{
+	    itemId: 'cpu-fans',
+	    colspan: 2,
+	    printBar: false,
+	    title: gettext('风扇'),
+	    textField: 'cpu_temperatures',
+	    renderer: function(value) {
+	        if (!value) { return '—'; }
+	        let out = [];
+	        for (const line of value.split('\n')) {
+	            let m = line.match(/^([^\s:][^:]*?):\s*(\d+)\s*RPM/);
+	            if (m) { out.push(m[1].trim() + ': ' + m[2] + 'RPM'); }
+	        }
+	        return out.length ? out.join(' | ') : '—';
+	    }
+	},
+PSP_SENSORS_DISP
     fi
 # API
 INFO_API="$cpu_info_api$nvme_info_api$hdd_info_api"
@@ -928,8 +976,8 @@ if [ $height2 -le 325 ]; then
     height2="300"
 fi
 
-    # IPMI 卡片：温度、风扇两独立行的余量
-    [ "${MODE:-}" = "ipmi" ] && height2=$(( ${height2:-300} + 102 ))
+    # 温度、风扇两独立行的余量（两模式一致）
+    height2=$(( ${height2:-300} + 102 ))
 }
 
 # 写出 perl 注入器（幂等 + 锚点定位；载荷从文件读入，避免插值）
