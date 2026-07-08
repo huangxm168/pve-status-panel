@@ -859,7 +859,7 @@ setup_sensors() {
     if [ -n "$found" ]; then
         printf '%s\n' "$found" > "$SENSORS_CONF"           # 持久化：开机自动加载
         log "成功：驱动 $found 已加载并持久化（$SENSORS_CONF）。"
-        log "风扇将在采集器下个周期（≤15s）自动出现于概览；浏览器 Ctrl+Shift+R 可即时刷新。"
+        log "风扇将在采集器下个周期自动出现于概览；浏览器 Ctrl+Shift+R 可即时刷新。"
         grep -E "$fan_re" <<< "$(sensors 2>/dev/null)" | head
     elif grep -qiE 'ACPI.*resource.*conflict|resource.*conflict.*(nct|it87|superio)' <<< "$(dmesg 2>/dev/null)"; then
         log "检测到 Super I/O 但其 I/O 端口被 ACPI 占用。需加内核参数后重启："

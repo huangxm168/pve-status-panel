@@ -24,15 +24,17 @@
 
 这两个文件归 `pve-manager` 包所有，**升级即被官方原版覆盖** —— 这正是「升级后面板消失」的根因。本项目用 APT 自愈 hook 在每次 `apt` 后自动重打来根治。
 
+硬件采集与后端注入是**解耦**的：注入进 `Nodes.pm` 的 Perl 块**只读** `/run/pve-status-panel/` 下的文件回填字段，真正跑 `ipmitool` / `smartctl` / `iostat` 的是一个独立的 **systemd timer 采集器**（普通 root 上下文，每 N 秒刷新一次写入 `/run`）。这样设计是因为 PVE 的 Web API 跑在 `perl -T` 污点模式、其上下文又看不到 `/dev/ipmi0`、`/dev/nvme*`，无法在 status 处理函数里直接跑硬件命令；改由采集器在普通上下文采样、后端只「读文件」回填，既避开污点与设备限制，也更快。
+
 ## 安装
 
 ```bash
-git clone https://github.com/<your-account>/pve-status-panel.git
+git clone https://github.com/huangxm168/pve-status-panel.git
 cd pve-status-panel
 sudo ./install.sh          # 或 sudo ./install.sh 3   指定采集刷新间隔（秒，默认 5）
 ```
 
-安装：清除 `smartctl`/`iostat` 的 setuid 基线、部署 `pve-status-panel` 到 `/usr/local/bin`、注入 + 部署采集器 timer、安装 APT 自愈 hook、首次应用。完成后在浏览器 **Ctrl+Shift+R** 强刷即可看到。
+安装：清除 `smartctl`/`iostat` 的 setuid 基线、部署 `pve-status-panel` 到 `/usr/local/bin`、注入 + 部署采集器 timer、安装 APT 自愈 hook、首次应用。若检测到 `/dev/ipmi0` 但系统缺 `ipmitool`，会自动 `apt` 安装（失败则回落 lm-sensors 模式）。完成后在浏览器 **Ctrl+Shift+R** 强刷即可看到。
 
 **刷新频率**：采集器每 N 秒刷新一次数据（默认 5 秒）。安装时用后缀参数指定（`./install.sh 3`），或随时 `pve-status-panel set-interval <秒>` 修改（≥2 秒；改后立即生效、重启仍生效）。
 
@@ -59,7 +61,7 @@ PSP_MODE=sensors pve-status-panel apply   # 强制指定数据源（ipmi|sensors
 - **ipmi**：存在 `/dev/ipmi0` 且 `ipmitool sdr` 可读时自动选用。温度 / 风扇来自 BMC，覆盖 CPU / 主板 / 网卡 / 内存 温度与全部风扇，稳定且不依赖内核版本。适合带 BMC 的服务器主板（如 ASRock Rack ROMED8-2T）。
 - **sensors**：无 IPMI 时回落，解析 `lm-sensors`。温度按芯片分组、友好标签（`k10temp`/`coretemp`→CPU、`amdgpu`→GPU，其余保留芯片名）、跳过 NVMe（已有独立卡片）；风扇过滤 0 RPM（未接的插座不显）。适合消费级主板。
 
-  消费级板的风扇/主板温挂在 Super I/O 芯片（Nuvoton `nct67xx` 用 `nct6775` 驱动、ITE 用 `it87`），全新系统默认不加载。跑一次 `pve-status-panel setup-sensors` 即可：它试探加载内核自带驱动（**不编译、不 dkms**）、命中即持久化到 `/etc/modules-load.d/`，采集器下个周期自动读到风扇——之后永久自动。搞不定的少数情况（ACPI 占用需 `acpi_enforce_resources=lax` / 芯片过新）只提示不硬来。
+  消费级板的风扇/主板温挂在 Super I/O 芯片（Nuvoton `nct67xx` 用 `nct6775` 驱动、ITE 用 `it87` 等），全新系统默认不加载。跑一次 `pve-status-panel setup-sensors` 即可：它按序试探一组内核自带驱动（`nct6775` / `nct6683` / `it87` / `w83627ehf` / `f71882fg`，**不编译、不 dkms**）、命中即持久化到 `/etc/modules-load.d/`，采集器下个周期自动读到风扇——之后永久自动。搞不定的少数情况（ACPI 占用需 `acpi_enforce_resources=lax` / 芯片过新）只提示不硬来。
 
 ## 兼容性与说明
 
