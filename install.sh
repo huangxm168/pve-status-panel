@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # 安装 pve-status-panel：在 PVE 节点「概览」卡片显示 CPU/温度·风扇/NVMe·磁盘 信息
-# 加固安装：清 setuid 基线 + 部署 applier + 首次应用 + 部署采集器 timer + APT 自愈 hook
-# 用法：sudo ./install.sh [采集间隔秒数]   省略则用默认 5 秒；之后可 pve-status-panel set-interval <秒> 改
+# 加固安装：清 setuid 基线 + 部署 applier + 首次应用 + 部署常驻采集守护 + APT 自愈 hook
+# 用法：sudo ./install.sh [最小采样间隔秒数]   省略则用默认 5 秒；之后可 pve-status-panel set-interval <秒> 改
 set -euo pipefail
 
-INTERVAL="${1:-}"                 # 可选后缀参数：采集刷新间隔（秒），空则用 applier 内置默认
+INTERVAL="${1:-}"                 # 可选后缀参数：最小采样间隔（秒），空则用 applier 内置默认
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN=/usr/local/bin/pve-status-panel
 HOOK=/etc/apt/apt.conf.d/99-pve-status-panel
@@ -23,6 +23,12 @@ if [ -e /dev/ipmi0 ] && ! command -v ipmitool >/dev/null 2>&1; then
     apt-get install -y ipmitool || echo "ipmitool 安装失败，将回落到 lm-sensors 模式"
 fi
 
+# 按需采集依赖 inotifywait（inotify-tools）：缺则安装（失败则采集守护自动退化为 2 秒 mtime 轮询）
+if ! command -v inotifywait >/dev/null 2>&1; then
+    echo "安装 inotify-tools（按需采集所需）..."
+    apt-get install -y inotify-tools || echo "inotify-tools 安装失败，采集守护将退化为 2 秒轮询"
+fi
+
 # 部署 applier
 install -m 0755 "$SRC_DIR/pve-status-panel.sh" "$BIN"
 
@@ -33,11 +39,11 @@ cat > "$HOOK" <<EOF
 DPkg::Post-Invoke { "[ -x $BIN ] && $BIN apply >/dev/null 2>&1 || true"; };
 EOF
 
-# 首次应用（注入 + 部署采集器脚本 + 立即采集一次）
+# 首次应用（注入 + 部署常驻采集守护 + 启用并预热一次）
 "$BIN" apply
-# 部署采集器 systemd 单元（含刷新间隔）：采集在普通 root 上下文跑，能访问 /dev/ipmi0、/dev/nvme*、无 perl -T 污点
+# 设置最小采样间隔（写 interval 文件；采集守护常驻于普通 root 上下文，能访问 /dev/ipmi0、/dev/nvme*、无 perl -T 污点）
 "$BIN" set-interval "$INTERVAL"
 
 echo
 echo "安装完成。请在浏览器按 Ctrl+Shift+R 强制刷新 PVE Web 界面查看节点「概览」卡片。"
-echo "查看状态：$BIN status ；改采集间隔：$BIN set-interval <秒> ；卸载/还原：sudo ./restore.sh（--full 彻底删除）"
+echo "查看状态：$BIN status ；改最小采样间隔：$BIN set-interval <秒> ；卸载/还原：sudo ./restore.sh（--full 彻底删除）"

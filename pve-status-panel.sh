@@ -7,8 +7,9 @@
 #   · 标记块注入（BEGIN/END 注释包裹）替代原脚本晦涩的 sed，配 perl -c 语法校验 + 失败自动回滚
 #   · APT DPkg::Post-Invoke 自愈：pve-manager/pve-manager 升级覆盖后自动重打，不再「升级即消失」
 #   · 板级双线路：有可用 IPMI 走 ipmitool（服务器板），否则走 lm-sensors（消费级板，复用上游渲染）
+#   · 采集与注入解耦 + 按需：常驻守护经 inotify 在被查看时才采样写 /run，后端只读回填——无污点、不碰设备、空闲零唤醒磁盘
 #
-# 子命令：apply（安装/重打） | restore（还原官方原版） | status（查看状态）
+# 子命令：apply（安装/重打） | restore（还原官方原版） | status（查看状态） | setup-sensors（消费级板风扇驱动） | set-interval（最小采样间隔）
 set -o pipefail
 export LC_ALL="${LC_ALL:-en_US.UTF-8}"
 
@@ -18,9 +19,12 @@ STATE_DIR="/usr/local/share/pve-status-panel"
 RUN_DIR="/run/pve-status-panel"
 COLLECTOR_BIN="/usr/local/bin/pve-status-panel-collect"
 SERVICE="pve-status-panel-collect.service"
-TIMER="pve-status-panel-collect.timer"
+TIMER="pve-status-panel-collect.timer"    # 旧版单元名，仅用于升级时清理
+TMPFILES_CONF="/etc/tmpfiles.d/pve-status-panel.conf"
+POLL_FILE="$RUN_DIR/.poll"                 # 按需信号：后端每次被查看时写此文件，守护据此采集
+INTERVAL_FILE="$STATE_DIR/interval"        # 最小采样间隔（秒），守护每次采集现读
 SENSORS_CONF="/etc/modules-load.d/pve-status-panel-sensors.conf"
-DEFAULT_INTERVAL=5    # 采集刷新间隔（秒），可被 install.sh <秒> / set-interval <秒> 覆盖
+DEFAULT_INTERVAL=5    # 最小采样间隔（秒），可被 install.sh <秒> / set-interval <秒> 覆盖
 MARK_BEGIN="pve-status-panel:BEGIN"
 MARK_END="pve-status-panel:END"
 
@@ -679,40 +683,82 @@ _bump_height() {
     sed -i "/widget.pveNodeStatus/,/},/ s/height: [0-9]\+/height: ${1}/" "$PVEMGR_JS"
 }
 
-# 生成采集脚本内容（全局 COLLECTOR）：普通 root 上下文跑硬件命令、把各字段写入 $RUN_DIR/<field>。
+# 生成采集守护脚本内容（全局 COLLECTOR）：常驻运行，把各硬件字段写入 $RUN_DIR/<field>。
 # 与前端 textField 同名（cpu_frequency / cpu_temperatures / <dev>_status），供后端只读回填。
-# 采集在 pvedaemon 之外运行 => 无 perl -T 污点、且能访问 /dev/ipmi0 与 /dev/nvme*（守护进程内两者均受限）。
+# 采集在 pvedaemon 之外常驻 => 无 perl -T 污点、且能访问 /dev/ipmi0 与 /dev/nvme*（守护进程内两者均受限）。
+# 按需：启动预热一次后挂在 inotify 上等 $POLL_FILE 变化再采；节流控制「有人看时」的最小采样间隔。
 _build_collector() {
-    local dev code
-    COLLECTOR="#!/usr/bin/env bash
-export LC_ALL=C
-D='${RUN_DIR}'
-mkdir -p \"\$D\"
-# 临时文件用隐藏名 + PID：后端 reader 跳过点开头文件、且并发采集不撞名；mv 原子替换
-_w() { local t=\"\$D/.wtmp.\$1.\$\$\"; cat > \"\$t\" 2>/dev/null && mv -f \"\$t\" \"\$D/\$1\"; }
-{ lscpu | grep MHz; cat /proc/cpuinfo | grep -i 'cpu MHz'; } 2>/dev/null | _w cpu_frequency
+    local dev code body
+
+    # collect() 函数体：跑硬件命令写入各字段（每行前置 4 空格缩进，落在函数内）
+    body="    { lscpu | grep MHz; cat /proc/cpuinfo | grep -i 'cpu MHz'; } 2>/dev/null | _w cpu_frequency
 "
     if [ "${MODE:-sensors}" = "ipmi" ]; then
-        COLLECTOR+="ipmitool sdr type Temperature 2>/dev/null | _w cpu_temperatures
-ipmitool sdr type Fan 2>/dev/null | _w cpu_fans
+        body+="    ipmitool sdr type Temperature 2>/dev/null | _w cpu_temperatures
+    ipmitool sdr type Fan 2>/dev/null | _w cpu_fans
 "
     else
-        COLLECTOR+="sensors 2>/dev/null | _w cpu_temperatures
+        body+="    sensors 2>/dev/null | _w cpu_temperatures
 "
     fi
     # iostat 采一次，供各盘复用（避免每盘各跑一次 1s 采样）
-    COLLECTOR+="_iostat=\"\$(iostat -d -x -k 1 1 2>/dev/null)\"
+    body+="    local _iostat=\"\$(iostat -d -x -k 1 1 2>/dev/null)\"
 "
     for dev in $(ls -1 /dev/nvme? 2>/dev/null); do
         code="${dev##*/}"
-        COLLECTOR+="{ smartctl -a ${dev} 2>/dev/null | grep -E 'Model Number|Total NVM Capacity|Temperature:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors'; echo \"\$_iostat\" | grep -E '^${code}'; } | _w ${code}_status
+        body+="    { smartctl -a ${dev} 2>/dev/null | grep -E 'Model Number|Total NVM Capacity|Temperature:|Percentage|Data Unit|Power Cycles|Power On Hours|Unsafe Shutdowns|Integrity Errors'; echo \"\$_iostat\" | grep -E '^${code}'; } | _w ${code}_status
 "
     done
     for dev in $(ls -1 /dev/sd? 2>/dev/null); do
         code="${dev##*/}"
-        COLLECTOR+="{ smartctl -a ${dev} 2>/dev/null | grep -E 'Model|Capacity|Power_On_Hours|Power_Cycle_Count|Power-Off_Retract_Count|Unexpected_Power_Loss|Unexpect_Power_Loss_Ct|POR_Recovery|Temperature'; echo \"\$_iostat\" | grep -E '^${code}'; } | _w ${code}_status
+        body+="    { smartctl -a ${dev} 2>/dev/null | grep -E 'Model|Capacity|Power_On_Hours|Power_Cycle_Count|Power-Off_Retract_Count|Unexpected_Power_Loss|Unexpect_Power_Loss_Ct|POR_Recovery|Temperature'; echo \"\$_iostat\" | grep -E '^${code}'; } | _w ${code}_status
 "
     done
+
+    COLLECTOR="#!/usr/bin/env bash
+# pve-status-panel 采集守护（常驻）：预热采一次后，挂在 inotify 上等 .poll 变化再采。
+export LC_ALL=C
+D='${RUN_DIR}'
+POLL='${POLL_FILE}'
+INTERVAL_FILE='${INTERVAL_FILE}'
+mkdir -p \"\$D\"
+# 临时文件用隐藏名 + PID：后端 reader 跳过点开头文件、且并发采集不撞名；mv 原子替换
+_w() { local t=\"\$D/.wtmp.\$1.\$\$\"; cat > \"\$t\" 2>/dev/null && mv -f \"\$t\" \"\$D/\$1\"; }
+
+# 采集一次：把各硬件字段写入 \$D
+collect() {
+${body}}
+
+# 节流：距上次采样不足 interval 秒则跳过（有人盯着看时避免每次轮询都猛跑 SMART、唤醒磁盘）
+_last=0
+throttle_ok() {
+    local iv now
+    iv=\"\$(cat \"\$INTERVAL_FILE\" 2>/dev/null || echo ${DEFAULT_INTERVAL})\"
+    [[ \"\$iv\" =~ ^[0-9]+\$ ]] || iv=${DEFAULT_INTERVAL}
+    now=\"\$(date +%s)\"
+    (( now - _last < iv )) && return 1
+    _last=\"\$now\"
+    return 0
+}
+
+collect                                   # 启动即预热一次（重启后一开概览就有数据）
+_last=\"\$(date +%s)\"
+
+# 事件循环：优先 inotify 等 .poll 变化；无 inotifywait 则退化为轻量 mtime 轮询（每 2 秒）
+if command -v inotifywait >/dev/null 2>&1; then
+    while read -r _f; do
+        [ \"\$_f\" = '.poll' ] || continue    # 只响应 .poll，忽略自身临时文件的 close_write 事件
+        throttle_ok && collect
+    done < <(inotifywait -m -q -e close_write --format '%f' \"\$D\" 2>/dev/null)
+else
+    _seen=0
+    while :; do
+        _m=\"\$(stat -c %Y \"\$POLL\" 2>/dev/null || echo 0)\"
+        [ \"\$_m\" != \"\$_seen\" ] && { _seen=\"\$_m\"; throttle_ok && collect; }
+        sleep 2
+    done
+fi
+"
 }
 
 apply() {
@@ -726,13 +772,14 @@ apply() {
     local ins api_tmp js_tmp disp
     ins="$(mktemp)"; _write_perl_inserter "$ins"
 
-    # ---- 部署采集器并立即采一次 ----
+    # ---- 部署采集守护 + 运行时单元 ----
     # pvedaemon 的 Web API 跑在 perl -T 污点模式、且其上下文看不到 /dev/ipmi0、/dev/nvme*，故不能在 status
     # 处理函数里直接跑 ipmitool/smartctl（反引号 → "Insecure dependency" 500；run_command → 设备打不开）。
-    # 解耦：采集器在普通 root 上下文跑命令写 $RUN_DIR，后端只“读文件”回填——无污点、不碰设备、且更快。
+    # 解耦：采集守护在普通 root 上下文常驻跑命令写 $RUN_DIR，后端只“读文件”回填——无污点、不碰设备、且更快。
     # （CLI pvesh 不走 -T 也不受设备限制，故此前用 pvesh 验证未能暴露，须用真实 HTTP API 验证。）
     printf '%s\n' "$COLLECTOR" > "$COLLECTOR_BIN"; chmod 0755 "$COLLECTOR_BIN"
-    "$COLLECTOR_BIN" >/dev/null 2>&1 || true
+    [ -f "$INTERVAL_FILE" ] || { mkdir -p "$STATE_DIR"; printf '%s\n' "$DEFAULT_INTERVAL" > "$INTERVAL_FILE"; }
+    _write_units          # 部署 tmpfiles + 常驻守护 service 并启用
 
     # ---- 后端 Nodes.pm：注入“只读 $RUN_DIR 回填 $res”静态块（file_get_contents，-T 安全）+ perl -c 兜底 ----
     _ensure_orig "$NODES_PM"
@@ -742,6 +789,16 @@ apply() {
         cat <<'PSP_READER'
         {
             my $psp_dir = '/run/pve-status-panel';
+            # 按需信号：记下「刚有人查看」，供采集守护经 inotify 触发采集。
+            # 普通写（非原子）以可靠触发 close_write；eval 兜底，任何失败都不影响节点 API。
+            eval {
+                mkdir($psp_dir) unless -d $psp_dir;
+                if (open(my $psp_pf, '>', "$psp_dir/.poll")) {
+                    print $psp_pf time();
+                    close($psp_pf);
+                }
+            };
+            # 只读回填：采集守护已写入的硬件字段（跳过点开头文件，含 .poll 与 .wtmp.* 临时文件）
             if (opendir(my $psp_dh, $psp_dir)) {
                 for my $psp_f (grep { !/^\./ && -f "$psp_dir/$_" } readdir($psp_dh)) {
                     $res->{$psp_f} = eval { PVE::Tools::file_get_contents("$psp_dir/$psp_f") } // '';
@@ -773,7 +830,7 @@ PSP_READER
     _bump_height "$height2"
 
     rm -f "$ins" "$api_tmp" "$js_tmp"
-    systemctl start "$TIMER" 2>/dev/null || true    # 若已装 timer 则确保在跑（周期刷新采集）
+    systemctl restart "$SERVICE" 2>/dev/null || true   # 加载最新守护脚本并预热采一次
     systemctl restart pvedaemon pveproxy
     log "应用完成。浏览器 Ctrl+Shift+R 强刷即可看到概览卡片。"
 }
@@ -791,54 +848,60 @@ _restore_file() {
 restore() {
     _restore_file "$NODES_PM"
     _restore_file "$PVEMGR_JS"
-    systemctl stop "$TIMER" 2>/dev/null
+    systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true   # 停常驻采集守护
+    systemctl disable --now "$TIMER"   >/dev/null 2>&1 || true   # 兼容停旧版 timer
     rm -f "$COLLECTOR_BIN"
     rm -rf "$RUN_DIR"
     systemctl restart pvedaemon pveproxy 2>/dev/null
-    log "已还原官方原版（采集器已停）。浏览器 Ctrl+Shift+R 强刷。"
+    log "已还原官方原版（采集守护已停）。浏览器 Ctrl+Shift+R 强刷。"
 }
 
-# 写采集器 systemd 单元（oneshot service + 周期 timer），$1=间隔秒数
-_write_timer_units() {
-    local iv="${1:-$DEFAULT_INTERVAL}"
+# 写运行时目录 tmpfiles + 常驻采集守护 service，并清理旧版周期 timer
+_write_units() {
+    # 保证 /run 目录重启后即存在（守护启动时 inotify 需目录先在）
+    cat > "$TMPFILES_CONF" <<EOF
+d $RUN_DIR 0755 root root -
+EOF
+    systemd-tmpfiles --create "$TMPFILES_CONF" >/dev/null 2>&1 || true
+
     cat > "/etc/systemd/system/$SERVICE" <<EOF
 [Unit]
-Description=pve-status-panel hardware sensor collector
+Description=pve-status-panel on-demand hardware sensor collector
 After=multi-user.target
 
 [Service]
-Type=oneshot
+Type=simple
 ExecStart=$COLLECTOR_BIN
-EOF
-    cat > "/etc/systemd/system/$TIMER" <<EOF
-[Unit]
-Description=Refresh pve-status-panel sensor data every ${iv}s
-
-[Timer]
-OnBootSec=${iv}
-OnUnitActiveSec=${iv}
-AccuracySec=1s
+Restart=always
+RestartSec=2
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
+
+    # 清理旧版周期 timer（老用户升级平滑过渡）
+    if [ -e "/etc/systemd/system/$TIMER" ]; then
+        systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$TIMER"
+    fi
+
     systemctl daemon-reload
-    systemctl enable --now "$TIMER" >/dev/null 2>&1 || true
+    systemctl enable --now "$SERVICE" >/dev/null 2>&1 || true
 }
 
-# 设置采集刷新间隔（秒）；无参则用默认。改后立即生效、重启仍生效
+# 设置「有人查看时的最小采样间隔」（秒）；无参则用默认。改后下次采集即生效、重启仍生效
 set_interval() {
     [ "$(id -u)" = 0 ] || { log "需 root 运行"; return 1; }
     local iv="${1:-$DEFAULT_INTERVAL}"
     { [[ "$iv" =~ ^[0-9]+$ ]] && [ "$iv" -ge 2 ]; } || { log "用法: set-interval <秒>（整数，≥2）"; return 1; }
-    _write_timer_units "$iv"
-    systemctl restart "$TIMER" 2>/dev/null || true
-    "$COLLECTOR_BIN" >/dev/null 2>&1 || true
-    log "采集刷新间隔已设为 ${iv} 秒。"
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$iv" > "$INTERVAL_FILE"    # 守护每次采集现读此文件，改后下次采集即生效，无需重启
+    _write_units                               # 确保守护单元在位并运行
+    log "最小采样间隔已设为 ${iv} 秒（有人查看概览时最快每 ${iv} 秒采一次）。"
 }
 
 # 可选：为消费级板加载 Super I/O 风扇/温度驱动（内核自带模块，不编译/不 dkms）。
-# 逐一试探常见驱动，哪个让 sensors 冒出 fanN 行即命中并持久化到 modules-load.d；采集器下个周期自动读到。
+# 逐一试探常见驱动，哪个让 sensors 冒出 fanN 行即命中并持久化到 modules-load.d；采集守护下次采集自动读到。
 setup_sensors() {
     [ "$(id -u)" = 0 ] || { log "需 root 运行"; return 1; }
     command -v sensors >/dev/null 2>&1 || { log "未装 lm-sensors，请先 apt install lm-sensors"; return 1; }
@@ -859,7 +922,7 @@ setup_sensors() {
     if [ -n "$found" ]; then
         printf '%s\n' "$found" > "$SENSORS_CONF"           # 持久化：开机自动加载
         log "成功：驱动 $found 已加载并持久化（$SENSORS_CONF）。"
-        log "风扇将在采集器下个周期自动出现于概览；浏览器 Ctrl+Shift+R 可即时刷新。"
+        log "风扇将在下次采集（有人查看概览时触发）自动出现于概览；浏览器 Ctrl+Shift+R 刷新即触发。"
         grep -E "$fan_re" <<< "$(sensors 2>/dev/null)" | head
     elif grep -qiE 'ACPI.*resource.*conflict|resource.*conflict.*(nct|it87|superio)' <<< "$(dmesg 2>/dev/null)"; then
         log "检测到 Super I/O 但其 I/O 端口被 ACPI 占用。需加内核参数后重启："
@@ -877,7 +940,10 @@ status() {
     echo "pvemanagerlib 注入: $(grep -q "$MARK_BEGIN" "$PVEMGR_JS" && echo yes || echo no)"
     echo "原文件快照(.orig) : $(ls "$STATE_DIR"/*.orig 2>/dev/null | wc -l) 个"
     echo "APT 自愈 hook     : $([ -f /etc/apt/apt.conf.d/99-pve-status-panel ] && echo installed || echo absent)"
-    echo "采集器 timer      : $(systemctl is-active "$TIMER" 2>/dev/null || echo inactive)（间隔 $(grep -oP 'OnUnitActiveSec=\K[0-9]+' "/etc/systemd/system/$TIMER" 2>/dev/null || echo '?') 秒）"
+    echo "采集守护(daemon)  : $(systemctl is-active "$SERVICE" 2>/dev/null || echo inactive)"
+    echo "inotifywait      : $(command -v inotifywait >/dev/null 2>&1 && echo present || echo 'absent（守护退化为 2s 轮询）')"
+    echo "最小采样间隔      : $(cat "$INTERVAL_FILE" 2>/dev/null || echo "$DEFAULT_INTERVAL") 秒"
+    echo "最近被查看        : $([ -f "$POLL_FILE" ] && echo "$(( $(date +%s) - $(stat -c %Y "$POLL_FILE") )) 秒前" || echo 从未)"
     echo "采集数据          : $(ls "$RUN_DIR" 2>/dev/null | wc -l) 个字段 @ $RUN_DIR"
     echo "风扇数据          : $(grep -qsE '[1-9][0-9]* *RPM' "$RUN_DIR"/cpu_fans "$RUN_DIR"/cpu_temperatures && echo 有 || echo '无（消费级板可跑 setup-sensors 开启）')"
 }
